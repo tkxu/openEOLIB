@@ -285,7 +285,7 @@ python examples/main_sample.py --engine eucalyptus
 
 ## ライセンス
 ```
-   Apache 2.0
+   ApacheLicense2.0
 ```
 
 ---
