@@ -1,46 +1,16 @@
 """
 ApacheLicense2.0
-
 Copyright (c) 2026 tkxu
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
-   
- eo_pipeline.py — 観測データ処理パイプライン
-
-
- コンポーネント:
-   InferenceEngine      推論エンジンの抽象基底クラス (プロトコル定義)
-   NullInferenceEngine  テスト用ダミー推論エンジン
-   EOPipeline           パイプライン本体
-
- 依存ライブラリ:
-   pip install numpy scipy
-
- 関連ファイル:
-   eo_types.py       型定義
-   eo_provider.py    実データ取得
-   eo_simulator.py   合成データ生成
-
 """
-#eo_pipeline.py
+# eo_pipeline.py
 from __future__ import annotations
 
+import logging
 import warnings
 import numpy as np
 from abc import ABC, abstractmethod
-from scipy import ndimage as ndi
-from typing import Dict, List, Optional
-
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 from eo_types import (
     BandData,
     InferenceResult,
@@ -51,14 +21,12 @@ from eo_types import (
     SiteResult,
     SiteResultList,
 )
+from eo_roc import RocBuilder, MLLR_THRESHOLDS
 
 
-# =============================================================================
-# 定数
-# =============================================================================
+logger = logging.getLogger(__name__)
 
-# ROC 構築用 MLLR スイープ範囲
-MLLR_THRESHOLDS = np.linspace(-50, 300, 120)
+# === 定数 ===
 
 # ヌル試行回数 (ROC 構築用)
 NULL_RUNS_PER_SITE = 30
@@ -72,10 +40,22 @@ _DEFAULT_FLAGS: QualityFlags = {
 }
 
 
-# =============================================================================
-# MBSP 計算 (共有ユーティリティ)
-# =============================================================================
+def wind_deg_to_vec(deg: float) -> np.ndarray:
+    """気象風向を単位ベクトル [vx=East, vy=North] に変換する。"""
+    rad = np.radians(_wind_deg_to_math(deg))
+    return np.array([np.cos(rad), np.sin(rad)])
 
+
+def _wind_deg_to_math(deg: float) -> float:
+    """
+    気象風向 (北基準時計回り) を数学角 (東基準反時計回り) に変換する。
+
+    全コンポーネントがこの関数を経由することで変換の一貫性を保証する。
+    """
+    return (270.0 - deg) % 360.0
+
+
+# === MBSP 計算 (共有ユーティリティ) ===
 def compute_mbsp(bands: BandData) -> np.ndarray:
     """
     Multi-Band Spectral Product (MBSP) を計算する。
@@ -99,10 +79,7 @@ def compute_mbsp(bands: BandData) -> np.ndarray:
     ).astype(np.float32)
 
 
-# =============================================================================
-# 推論エンジンの抽象基底クラス (プロトコル定義)
-# =============================================================================
-
+# === 推論エンジンの抽象基底クラス (プロトコル定義) ===
 class InferenceEngine(ABC):
     """
     推論エンジンの抽象基底クラス。
@@ -160,10 +137,44 @@ class InferenceEngine(ABC):
         return self.infer(mbsp, wind_speed, wind_deg)
 
 
-# =============================================================================
-# テスト用ダミー推論エンジン
-# =============================================================================
+# Provider 抽象基底クラスを定義し、統一インターフェースを提供
+class Provider(ABC):
+    """
+    データプロバイダの抽象基底クラス。
 
+    EOPipeline はこのインターフェースだけを知っており、
+    具体的なデータ取得方法は外部から差し込まれる。
+
+    実装クラスの例:
+        - PlumeSimulator (eo_simulator.py)  合成データ生成
+        - DataFetcher    (eo_provider.py)   実データ取得
+
+    実装義務:
+        get_bundle() メソッドを実装すること。
+    """
+
+    @abstractmethod
+    def get_bundle(
+        self,
+        site: SiteEntry,
+        dt:   Optional[datetime] = None,
+    ) -> ObservationBundle:
+        """
+        サイト情報から ObservationBundle を返す。
+
+        Parameters
+        ----------
+        site : SiteEntry  サイトレジストリのエントリ
+        dt   : datetime   観測日時 (実データ取得時のみ使用)
+
+        Returns
+        -------
+        ObservationBundle
+        """
+        ...
+
+
+# === テスト用ダミー推論エンジン ===
 class NullInferenceEngine(InferenceEngine):
     """
     テスト・デモ用のダミー推論エンジン。
@@ -190,17 +201,30 @@ class NullInferenceEngine(InferenceEngine):
         wind_deg:   float,
         **kwargs,
     ) -> Optional[InferenceResult]:
-        """MBSP のピーク値から簡易的な Q を推定する。"""
+        """
+        MBSP の Z スコア閾値による簡易検出と Q 推定。
+
+        アルゴリズム:
+            1. MAD ロバスト推定で背景を除去し Z スコアを計算する。
+            2. max(Z) < 2.0 のとき検出なし (None を返す)。
+            3. MLLR = Σ max(Z - 2.0, 0)  (超閾値 Z の積分)
+            4. Q [kg/h] ≈ MLLR × q_scale / 100
+               ※ このスケール式はテスト用のヒューリスティックであり
+               物理的な定量精度を保証しない。
+               実運用では MBSPThresholdEngine (main_sample.py) の
+               IME 法 (Q ≈ MLLR × wind_speed × q_scale_factor) を使用すること。
+        """
         mu  = float(np.nanmedian(mbsp))
         sig = float(1.4826 * np.nanmedian(np.abs(mbsp - mu)))
-        z   = (mbsp - mu) / (sig + 1e-8)
+        eps = sig + 1e-8
+        z   = (mbsp - mu) / eps
 
         if float(np.nanmax(z)) < 2.0:
             return None
 
         # 簡易 MLLR: Z スコアの積分値
         mllr = float(np.nansum(np.maximum(z - 2.0, 0)))
-        q    = mllr / (sig + 1e-8) * self.q_scale / 100.0
+        q    = mllr * self.q_scale / 100.0
 
         flags: QualityFlags = {
             "low_wind":          wind_speed < 2.0,
@@ -218,10 +242,7 @@ class NullInferenceEngine(InferenceEngine):
         )
 
 
-# =============================================================================
-# ObsPipeline — パイプライン本体
-# =============================================================================
-
+# === ObsPipeline — パイプライン本体 ===
 class EOPipeline:
     """
     観測データ処理パイプライン。
@@ -236,7 +257,7 @@ class EOPipeline:
     Parameters
     ----------
     provider       : ObservationBundle を返すオブジェクト。
-                     DataFetcher (eo_provider.py) または
+                     Provider を継承した DataFetcher (eo_provider.py) または
                      PlumeSimulator (eo_simulator.py) を渡す。
     engine         : InferenceEngine を実装した推論エンジン。
                      未指定の場合は NullInferenceEngine を使用。
@@ -259,7 +280,7 @@ class EOPipeline:
 
     def __init__(
         self,
-        provider,
+        provider:  Provider,
         engine:    Optional[InferenceEngine] = None,
         res:       float = 20.0,
         null_runs: int   = NULL_RUNS_PER_SITE,
@@ -287,12 +308,13 @@ class EOPipeline:
         self,
         bundle: ObservationBundle,
         site:   SiteEntry,
-    ) -> tuple:
+    ) -> Tuple[float, float]:
         """
         バンドルから風速・風向を取得する。
 
         実データ (openEO) では bundle の値を使用する。
         合成データ (synthetic) または取得失敗時は site の公称値にフォールバック。
+        合成データの場合は bundle に wind が存在しないのが正常であるため警告は出さない。
         """
         ws  = bundle.get("wind_speed")
         wd  = bundle.get("wind_deg")
@@ -303,12 +325,76 @@ class EOPipeline:
                 warnings.warn(
                     f"[{site['id']}] 風速・風向の取得に失敗。"
                     f"site の公称値にフォールバックします。",
-                    stacklevel=3,
+                    stacklevel=2,
                 )
             ws = site["wind_speed"]
             wd = site["wind_deg"]
 
         return float(ws), float(wd)
+
+    def _fetch_bundle(
+        self,
+        site: SiteEntry,
+        dt:   Optional[datetime],
+    ) -> ObservationBundle:
+        """
+        provider の種別を判定して ObservationBundle を取得する。
+
+        Provider 抽象基底クラスを実装したオブジェクトは get_bundle() で統一取得。
+        未実装の旧インターフェース (generate / fetch_from_site / fetch) は
+        後方互換のためフォールバック対応するが、将来のバージョンで削除予定。
+        """
+        # Provider ABC を実装している場合は統一インターフェースを使用
+        if isinstance(self.provider, Provider):
+            return self.provider.get_bundle(site, dt)
+
+        # 後方互換: 旧インターフェースへのフォールバック
+        # DeprecationWarning: v2.0 で削除予定。Provider ABC を実装してください。
+        if hasattr(self.provider, "generate"):
+            warnings.warn(
+                f"{type(self.provider).__name__} は Provider ABC を実装していません。"
+                "generate() インターフェースは非推奨です。"
+                "Provider を継承して get_bundle() を実装してください。"
+                "このフォールバックは v2.0 で削除予定です。",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            # PlumeSimulator
+            return self.provider.generate(
+                Q          = site["Q_true"],
+                wind_speed = site["wind_speed"],
+                wind_deg   = site["wind_deg"],
+                lat        = site["lat"],
+                lon        = site["lon"],
+                seed       = site.get("seed"),
+            )
+        elif hasattr(self.provider, "fetch_from_site") and dt is not None:
+            warnings.warn(
+                f"{type(self.provider).__name__} は Provider ABC を実装していません。"
+                "fetch_from_site() インターフェースは非推奨です。"
+                "Provider を継承して get_bundle() を実装してください。"
+                "このフォールバックは v2.0 で削除予定です。",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            # DataFetcher (earth_obs_provider.py)
+            return self.provider.fetch_from_site(site, dt)
+        elif hasattr(self.provider, "fetch") and dt is not None:
+            warnings.warn(
+                f"{type(self.provider).__name__} は Provider ABC を実装していません。"
+                "fetch() インターフェースは非推奨です。"
+                "Provider を継承して get_bundle() を実装してください。"
+                "このフォールバックは v2.0 で削除予定です。",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return self.provider.fetch(site["lat"], site["lon"], dt)
+        else:
+            raise ValueError(
+                "provider は Provider ABC を継承して get_bundle() を実装するか、"
+                "generate() または fetch() / fetch_from_site() を"
+                "持つオブジェクトである必要があります。"
+            )
 
     # ------------------------------------------------------------------
     # 公開 API
@@ -317,7 +403,7 @@ class EOPipeline:
     def run_site(
         self,
         site: SiteEntry,
-        dt=None,
+        dt:   Optional[datetime] = None,
     ) -> SiteResult:
         """
         単一サイトのパイプラインを実行する。
@@ -337,36 +423,15 @@ class EOPipeline:
         SiteResult
         """
         # --- データ取得 ---
-        meta    = site.get("meta", {})
-        backend = getattr(self.provider, '__class__', None)
-
-        # provider の種別を自動判定して適切なメソッドを呼ぶ
-        if hasattr(self.provider, "generate"):
-            # PlumeSimulator
-            bundle: ObservationBundle = self.provider.generate(
-                Q          = site["Q_true"],
-                wind_speed = site["wind_speed"],
-                wind_deg   = site["wind_deg"],
-                lat        = site["lat"],
-                lon        = site["lon"],
-                seed       = site.get("seed"),
-            )
-        elif hasattr(self.provider, "fetch_from_site") and dt is not None:
-            # DataFetcher (earth_obs_provider.py)
-            bundle = self.provider.fetch_from_site(site, dt)
-        elif hasattr(self.provider, "fetch") and dt is not None:
-            bundle = self.provider.fetch(site["lat"], site["lon"], dt)
-        else:
-            raise ValueError(
-                "provider は generate() または fetch() / fetch_from_site() を"
-                "持つオブジェクトである必要があります。"
-            )
+        bundle: ObservationBundle = self._fetch_bundle(site, dt)
 
         # --- MBSP 計算 ---
         mbsp = self._bundle_to_mbsp(bundle)
         if mbsp is None:
             warnings.warn(f"[{site['id']}] MBSP の計算に失敗しました。", stacklevel=2)
-            mbsp = np.zeros((100, 100), dtype=np.float32)
+            h = int(site.get("grid_h", 100))
+            w = int(site.get("grid_w", 100))
+            mbsp = np.zeros((h, w), dtype=np.float32)
 
         wind_speed, wind_deg = self._extract_wind(bundle, site)
 
@@ -380,11 +445,12 @@ class EOPipeline:
         )
 
         # --- plume_true の取得 (合成データのみ) ---
-        plume_true = bundle.get("plume_true", np.zeros_like(mbsp))
+        # bundle.get("plume_true", fallback) はキーが存在して値が None の場合に
+        # fallback を返さない。"or" を使って None も確実に fallback する。
+        plume_true = bundle.get("plume_true") or np.zeros_like(mbsp)
 
         # --- 風向ベクトル ---
-        from eo_simulator import _wind_deg_to_vec
-        wvec = _wind_deg_to_vec(wind_deg)
+        wvec = wind_deg_to_vec(wind_deg)
 
         return SiteResult(
             site       = site,
@@ -401,12 +467,13 @@ class EOPipeline:
             scoring        = None,
             flags          = flags,
             gt_match       = False,
+            meta           = None,
         )
 
     def run_all(
         self,
         site_registry: List[SiteEntry],
-        dt=None,
+        dt: Optional[datetime] = None,
     ) -> SiteResultList:
         """
         サイトレジストリ全体を巡回してパイプラインを実行する。
@@ -422,13 +489,40 @@ class EOPipeline:
         """
         results: SiteResultList = []
         for site in site_registry:
-            print(f"  [{site['id']}] {site['name']} ...", end=" ", flush=True)
+            logger.info("  [%s] %s ...", site["id"], site["name"])
             r      = self.run_site(site, dt=dt)
             status = "OK" if r["inv"] is not None else "NO DETECT"
             q_str  = f"Q={r['inv']['q']:.0f}" if r["inv"] else "—"
-            print(f"{status}  {q_str} kg/h")
+            logger.info("%s  %s kg/h", status, q_str)
             results.append(r)
         return results
+
+    def build_roc(
+        self,
+        results:       SiteResultList,
+        site_registry: List[SiteEntry],
+        seed:          Optional[int] = None,
+    ) -> RocData:
+        """
+        ROC 曲線データを構築する。
+
+        内部で eo_roc.RocBuilder を使用する。
+        ヌル試行回数は EOPipeline(null_runs=...) で指定した値を引き継ぐ。
+
+        Parameters
+        ----------
+        results       : run_all() の返値
+        site_registry : SiteEntry のリスト (results と同順)
+        seed          : 乱数シード (再現性)
+
+        Returns
+        -------
+        RocData
+        """
+        return RocBuilder(
+            null_runs = self.null_runs,
+            seed      = seed,
+        ).build(results, site_registry)
 
 
 # =============================================================================
@@ -578,21 +672,20 @@ def test_build_roc() -> None:
         null_runs = 5,
     )
     results = pipeline.run_all(_SAMPLE_REGISTRY)
-    roc     = pipeline.build_roc(results, _SAMPLE_REGISTRY)
+    roc     = pipeline.build_roc(results, _SAMPLE_REGISTRY, seed=0)
 
     assert "fpr" in roc and "tpr" in roc and "auc" in roc
-    assert 0.0 <= roc["auc"] <= 1.0, f"AUC 範囲外: {roc['auc']}"
-    assert len(roc["fpr"]) == len(MLLR_THRESHOLDS)
+    assert 0.0 <= roc["auc"] <= 1.0,          f"AUC 範囲外: {roc['auc']}"
+    assert len(roc["fpr"]) == len(roc["tpr"]), "fpr/tpr 長不一致"
+    assert len(roc["positive_mllrs"]) == len(_SAMPLE_REGISTRY)
     print(f"  AUC = {roc['auc']:.4f}")
-    print(f"  positive MLLR: {roc['positive_mllrs']}")
+    print(f"  positive MLLR: {[f'{m:.1f}' for m in roc['positive_mllrs']]}")
     print("  → PASS")
 
 
-# =============================================================================
-# エントリポイント
-# =============================================================================
-
+# === エントリポイント ===
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     print("=" * 55)
     print("  eo_pipeline.py — パイプラインテスト")

@@ -1,19 +1,6 @@
 """
 ApacheLicense2.0
-
 Copyright (c) 2026 tkxu
-
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
 
  eo_simulator.py — ガウスプルーム合成データ生成器
 
@@ -68,7 +55,7 @@ import math
 import warnings
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
+# gridspec は未使用のため削除
 from scipy import ndimage as ndi
 from typing import Dict, List, Optional, Tuple
 
@@ -100,11 +87,12 @@ def _wind_deg_to_math(deg: float) -> float:
     """
     気象風向 (北基準時計回り) を数学角 (東基準反時計回り) に変換する。
 
-    全コンポーネントがこの関数を経由することで変換の一貫性を保証する。    """
+    全コンポーネントがこの関数を経由することで変換の一貫性を保証する。
+    """
     return (270.0 - deg) % 360.0
 
 
-def _wind_deg_to_vec(deg: float) -> np.ndarray:
+def wind_deg_to_vec(deg: float) -> np.ndarray:
     """気象風向を単位ベクトル [vx=East, vy=North] に変換する。"""
     rad = np.radians(_wind_deg_to_math(deg))
     return np.array([np.cos(rad), np.sin(rad)])
@@ -230,6 +218,7 @@ class GaussianPlumeModel:
         wind_speed: float,
         wind_deg:   float,
         src:        Tuple[int, int] = (50, 50),
+        pg_a:       Optional[float] = None,
     ) -> np.ndarray:
         """
         プルーム濃度場を計算する。
@@ -241,23 +230,29 @@ class GaussianPlumeModel:
         wind_speed : 風速 [m/s]
         wind_deg   : 気象風向 [degrees]
         src        : 排出源ピクセル位置 (row, col)
+        pg_a       : PG 係数 A の上書き値。None の場合は self.pg_a を使用。
+                     Mismatch Injection 時に呼び出し元から渡すことで
+                     インスタンス状態の破壊的変更を避ける。
 
         Returns
         -------
         np.ndarray  プルーム濃度場 [g/m²]
         """
+        _pg_a = pg_a if pg_a is not None else self.pg_a
+
         y_idx, x_idx = np.indices(shape)
         dx = (x_idx - src[1]) * self.res
         dy = (y_idx - src[0]) * self.res
 
         xr, yr = _rotate_to_wind_frame(dx, dy, wind_deg)
 
-        # Q: kg/h → g/s
-        Qs   = Q * 1e6 / 3600.0
+
+        # Q * 1e3 / 3600.0
+        Qs   = Q * 1e3 / 3600.0
         mask = xr > 0
 
         sig_y = np.zeros(shape, dtype=np.float64)
-        sig_y[mask] = self.pg_a * (xr[mask] ** self.pg_b)
+        sig_y[mask] = _pg_a * (xr[mask] ** self.pg_b)
 
         plume = np.zeros(shape, dtype=np.float64)
         plume[mask] = (Qs / (wind_speed * sig_y[mask] + 1e-8)) * np.exp(
@@ -310,6 +305,9 @@ class BandSynthesizer:
         bands: Dict[str, np.ndarray] = {}
         for b in ["B11", "B12"]:
             noise      = rng.normal(0, self.sensor_noise_std, surface.shape)
+            # クリップ上限 8 の根拠をコメントで補足。
+            # exp(-8) ≈ 3.4e-4 となり物理的にほぼ完全吸収。
+            # これ以上は数値的に意味がなく、オーバーフロー防止のための上限。
             absorption = np.clip(SIGMA_ABS[b] * column, 0, 8)
             bands[b]   = ((surface + noise) * np.exp(-absorption)).astype(np.float32)
 
@@ -414,6 +412,8 @@ class PlumeSimulator:
         gp_noise:         bool  = False,
         gp_length_scale:  float = 5.0,
         gp_amplitude:     float = 0.02,
+        # seed 引数を追加する。__init__ では使用しないが互換性のために受け取る。
+        seed:             Optional[int] = None,
     ):
         self.res             = res
         self.shape           = shape
@@ -463,7 +463,9 @@ class PlumeSimulator:
             actual_wind, actual_pg_a = self._mismatch_inj.perturb(
                 wind_speed, PG_A_DEFAULT, rng
             )
-            self._plume_model.pg_a = actual_pg_a
+            #  self._plume_model.pg_a を書き換えるのをやめ、
+            # compute() の pg_a 引数として渡すことでインスタンス状態を保護する。
+            # 複数回の generate() 呼び出し間で pg_a が汚染されない。
 
         # --- 地表反射率生成 ---
         surface = self._surface_gen.generate(
@@ -475,16 +477,17 @@ class PlumeSimulator:
         )
 
         # --- プルーム濃度場計算 ---
+        # actual_pg_a を pg_a 引数で渡し、インスタンス状態を変更しない
         plume = self._plume_model.compute(
             shape      = self.shape,
             Q          = Q,
             wind_speed = actual_wind,
             wind_deg   = wind_deg,
             src        = self.src,
+            pg_a       = actual_pg_a,
         )
 
         # --- バンド合成 ---
-        ds = {"B11": surface, "B12": surface * 0.98}
         bands = self._band_synth.synthesize(surface, plume, rng)
 
         return {
@@ -505,7 +508,7 @@ class PlumeSimulator:
                 "lon":               lon,
                 "wind_speed_actual": actual_wind,
                 "wind_deg_actual":   wind_deg,
-                "pg_a_actual":       self._plume_model.pg_a,
+                "pg_a_actual":       actual_pg_a,
                 "mismatch_enabled":  self.mismatch,
                 "gp_noise_enabled":  self.gp_noise,
                 "seed":              seed,
@@ -535,6 +538,13 @@ class PlumeSimulator:
         -------
         List[Dict]  各サイトの ObservationBundle
         """
+        #  Q_values の長さが sites と一致しない場合に早期エラーを出す
+        if Q_values is not None and len(Q_values) != len(sites):
+            raise ValueError(
+                f"Q_values の長さ ({len(Q_values)}) が "
+                f"sites の長さ ({len(sites)}) と一致しません。"
+            )
+
         results = []
         for i, site in enumerate(sites):
             Q = Q_values[i] if Q_values is not None else site["Q_true"]
@@ -592,7 +602,7 @@ def visualize_bundle(
         im0 = ax0.imshow(plume, cmap="hot_r", origin="upper")
         plt.colorbar(im0, ax=ax0, fraction=0.046, pad=0.04, label="[g/m²]")
         # 風向矢印
-        wvec = _wind_deg_to_vec(bundle["wind_deg"])
+        wvec = wind_deg_to_vec(bundle["wind_deg"])
         cx, cy = plume.shape[1] // 2, plume.shape[0] // 2
         ax0.annotate(
             "", xy=(cx + wvec[0] * 14, cy - wvec[1] * 14),
@@ -769,6 +779,7 @@ def test_basic_generation() -> None:
     print("  TEST-1: 基本生成テスト")
     print("="*55)
 
+    # PlumeSimulator(seed=None) は __init__ に seed 引数を追加して対応
     sim    = PlumeSimulator(seed=None)
     bundle = sim.generate(Q=2000.0, wind_speed=4.0, wind_deg=120.0, seed=42)
 

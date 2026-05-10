@@ -1,71 +1,8 @@
-# =============================================================================
-# eo_types.py — モジュール間インターフェースの型定義
-#
-# 役割:
-#   earth-obs-toolkit を構成する各モジュール間を流れるデータ構造を
-#   TypedDict として定義する。
-#
-#   ファイル名について:
-#     Python 標準ライブラリに types モジュールが存在するため、
-#     types.py という名前は import 時の衝突リスクがある。
-#     EO (Earth Observation) 分野の標準略語を用いて
-#     eo_types.py に統一することで回避する。
-#
-#   すべてのモジュールはこのファイルだけをインポートすることで
-#   互いの内部実装を知らずにインターフェースを共有できる。
-#
-#   ┌──────────────────────────────────────────────────────────────┐
-#   │  依存関係                                                      │
-#   │                                                               │
-#   │  eo_types.py  ←  eo_provider.py      (ObservationBundle)    │
-#   │  eo_types.py  ←  eo_simulator.py     (SyntheticBundle)      │
-#   │  eo_types.py  ←  eo_pipeline.py      (SiteResult)           │
-#   │  eo_types.py  ←  eo_visualisation.py (SiteResult を消費)    │
-#   │                                                               │
-#   │  eo_types.py は他のモジュールを一切 import しない。            │
-#   └──────────────────────────────────────────────────────────────┘
-#
-# 型の階層:
-#
-#   センサ種別
-#     SensorSource         データソース種別リテラル
-#     BandSetName          バンドセット名リテラル
-#     S2_BAND_SETS         バンドセット定数辞書
-#
-#   Layer 0: サイトレジストリ
-#     SiteEntry            サイトの座標・気象・排出量情報
-#
-#   Layer 2: 観測データ
-#     BandData             Sentinel-2 全13バンド (B11/B12 は必須、他はオプション)
-#     MultiTemporalBands   時系列バンドデータ (Project Eucalyptus 等の時系列モデル用)
-#     ObservationMeta      観測メタデータ (backend / band_set / sensors を含む)
-#     GroundSensorData     地上センサ観測値 (CH4濃度・風速・気温・気圧等)
-#     GroundSensorMeta     地上センサのメタデータ (センサ種別・座標・認証情報)
-#     ObservationBundle    統合データコンテナ (衛星 + ERA5 + S5P + 地上センサ)
-#     SyntheticMeta        合成データ専用メタ (ObservationMeta を拡張)
-#     SyntheticBundle      合成データ専用バンドル (ObservationBundle を拡張)
-#
-#   Layer 4: 推論・スコアリング結果
-#     QualityFlags         推論エンジンの品質フラグ
-#     InferenceResult      逆推定エンジンの出力 (q / q_std / mllr / p_det)
-#     PhysResult           物理整合性検証結果 (wind_align / downwind_snr)
-#     ScoringResult        Tier 判定・DetScore 結果
-#
-#   Layer 5: パイプライン実行結果
-#     SiteResult           run_site() の全出力
-#     RocData              ROC 曲線データ
-#
-# 後方互換性:
-#   BandData は total=False で全フィールドをオプションとしているが、
-#   B11/B12 は論理的必須フィールドとしてコメントで明示する。
-#   既存の {"B11": arr, "B12": arr} 形式のコードはそのまま動作する。
-#
-# Python バージョン:
-#   TypedDict は Python 3.8 以降で利用可能。
-#   Literal  は Python 3.8 以降で利用可能 (typing.Literal)。
-#
-# =============================================================================
-
+"""
+ApacheLicense2.0
+Copyright (c) 2026 tkxu
+"""
+#eo_types.py
 from __future__ import annotations
 
 from typing import Dict, List, Literal, Optional, Tuple
@@ -73,6 +10,11 @@ from typing import Dict, List, Literal, Optional, Tuple
 import numpy as np
 
 from typing import TypedDict
+
+try:
+    from typing import Required  # type: ignore[attr-defined]  # Python 3.11+
+except ImportError:
+    from typing_extensions import Required  # type: ignore[assignment]
 
 
 # =============================================================================
@@ -231,9 +173,9 @@ class ObservationMeta(TypedDict, total=False):
         例: ["sentinel2", "era5", "sentinel5p", "ground_insitu"]
     """
     # --- 必須フィールド ---
-    lat:         float    # 中心緯度 [degrees]
-    lon:         float    # 中心経度 [degrees]
-    backend:     str      # SensorSource 参照
+    lat:         float        # 中心緯度 [degrees]
+    lon:         float        # 中心経度 [degrees]
+    backend:     SensorSource # データソース種別 (SensorSource リテラル)
 
     # --- 実データのみ ---
     datetime:    str             # 観測日時 ISO8601
@@ -244,72 +186,13 @@ class ObservationMeta(TypedDict, total=False):
     vza_mean:    Optional[float] # 衛星天頂角の空間平均 [degrees]
 
     # --- 拡張フィールド ---
-    band_set:    str             # BandSetName 参照 (取得済みバンドセット)
-    sensors:     List[str]       # 利用可能データソースのリスト
-    res_m:       float           # 統一解像度 [m/px] (デフォルト: 20.0)
+    band_set:    BandSetName  # 取得済みバンドセット (BandSetName リテラル)
+    sensors:     List[str]    # 利用可能データソースのリスト
+    res_m:       float        # 統一解像度 [m/px] (デフォルト: 20.0)
+    provenance_key: Optional[str]  # DatasetProvenance.fingerprint() の返値
+    era5_backend:   Optional[str]  # ERA5 バックエンド識別子 (例: "cdsapi_stable")
 
 
-# =============================================================================
-# Layer 2 — 地上センサデータ
-# =============================================================================
-
-class GroundSensorData(TypedDict, total=False):
-    """
-    地上センサ観測値。
-
-    固定観測局・移動観測車・GNSS センサ・ライダー等から取得した
-    インサイチュ計測値を格納する。
-    ObservationBundle["ground_sensor"] に格納される。
-
-    すべてのフィールドはオプション（センサ種別によって異なる）。
-    利用可能なフィールドは GroundSensorMeta["available_fields"] で識別する。
-
-    単位系:
-        濃度    : ppm (体積比) または ppb (S5P との比較時)
-        風速    : m/s
-        温度    : K (絶対温度)
-        気圧    : Pa
-        湿度    : % (相対湿度)
-        フラックス: kg/h (排出量換算後)
-    """
-    # --- 大気組成 ---
-    ch4_ppm:       Optional[float]      # CH4 濃度 [ppm]
-    ch4_ppb:       Optional[float]      # CH4 濃度 [ppb]  S5P との比較用
-    co2_ppm:       Optional[float]      # CO2 濃度 [ppm]
-    co_ppb:        Optional[float]      # CO 濃度 [ppb]
-
-    # --- 気象 ---
-    wind_speed:    Optional[float]      # 地上風速 [m/s]  超音波風速計等
-    wind_deg:      Optional[float]      # 地上風向 [degrees FROM方向]
-    temperature_k: Optional[float]      # 気温 [K]
-    pressure_pa:   Optional[float]      # 気圧 [Pa]
-    humidity_pct:  Optional[float]      # 相対湿度 [%]
-
-    # --- ライダー (鉛直プロファイル) ---
-    wind_profile:  Optional[np.ndarray] # 高度別風速プロファイル [m/s] shape=(N_alt,)
-    alt_levels_m:  Optional[np.ndarray] # 高度レベル [m]  shape=(N_alt,)
-
-    # --- タイムスタンプ ---
-    timestamp:     Optional[str]        # 観測日時 ISO8601
-    averaging_sec: Optional[int]        # 平均化時間 [秒]  (例: 60, 600)
-
-
-class GroundSensorMeta(TypedDict, total=False):
-    """
-    地上センサのメタデータ。
-
-    ObservationBundle["ground_sensor_meta"] に格納される。
-    センサ種別・設置座標・データ取得元 URL 等を記述する。
-    """
-    sensor_type:      str          # SensorSource 参照
-    sensor_id:        str          # センサ識別子 (例: "SITE-TM-01-GS01")
-    sensor_lat:       float        # センサ設置緯度 [degrees]
-    sensor_lon:       float        # センサ設置経度 [degrees]
-    sensor_alt_m:     float        # センサ設置高度 [m above ground]
-    dist_to_site_m:   float        # サイト中心からの距離 [m]
-    data_source_url:  str          # データ取得元 URL (例: OpenAQ API)
-    available_fields: List[str]    # 利用可能なフィールド名リスト
-    notes:            str          # 備考 (センサ精度・キャリブレーション情報等)
 
 
 class ObservationBundle(TypedDict, total=False):
@@ -381,10 +264,15 @@ class SyntheticBundle(ObservationBundle):
 
     eo_simulator.py が生成する。ObservationBundle との互換性を保ちつつ
     plume_true・Q_true・SyntheticMeta を持つことを型で明示する。
+
+    Required[] を使用して必須フィールドを明示する。
+    ObservationBundle は total=False であるため、
+    サブクラスで必須にしたいフィールドは Required[] で個別に指定する。
+    Python 3.8〜3.10 では typing_extensions が必要。
     """
-    plume_true: np.ndarray    # 真のプルーム濃度場 [g/m²]  shape=(H,W)  (必須)
-    Q_true:     float         # 真の排出量 [kg/h]            (必須)
-    meta:       SyntheticMeta
+    plume_true: Required[np.ndarray]    # 真のプルーム濃度場 [g/m²]  shape=(H,W)  (必須)
+    Q_true:     Required[float]         # 真の排出量 [kg/h]            (必須)
+    meta:       Required[SyntheticMeta]
 
 
 # =============================================================================
@@ -475,6 +363,10 @@ class SiteResult(TypedDict, total=False):
     phys_result:    Optional[PhysResult]        # 物理整合性検証結果
     scoring:        Optional[ScoringResult]     # Tier 判定結果
     flags:          QualityFlags                # 推論品質フラグ
+
+    # --- 検証用 ---
+    gt_match:       bool                  # Ground truth 一致フラグ (検証用)
+    meta:           Optional[Dict]        # パイプライン実行時の追加メタデータ
 
 
 

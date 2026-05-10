@@ -3,17 +3,6 @@ ApacheLicense2.0
 
 Copyright (c) 2026 tkxu
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
-
-       http://www.apache.org/licenses/LICENSE-2.0
-
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
 
  eo_visualisation.py — 観測データ・パイプライン結果の可視化
 
@@ -146,6 +135,7 @@ def _table_style(tbl, n_rows: int, n_cols: int, tc_list: List[str]) -> None:
         for j in range(n_cols):
             tbl[i + 1, j].set_facecolor(fc)
             tbl[i + 1, j].set_text_props(color=tc)
+
 
 
 # =============================================================================
@@ -530,7 +520,7 @@ class ReportBuilder:
 
     def __init__(
         self,
-        report_title:  str   = "earth-obs-toolkit — Validation Report",
+        report_title:  str   = "Validation Report",
         detect_thresh: float = _DETECT_THRESH,
     ):
         self.report_title  = report_title
@@ -580,8 +570,9 @@ class ReportBuilder:
                  ha="center", va="top", fontsize=14,
                  fontweight="bold", color=_TEXT_WHITE)
         site_ids = " · ".join(r["site"]["id"] for r in results)
-        backend  = (results[0].get("meta", {}).get("backend", "unknown")
-                    if results else "unknown")
+        backend = ((results[0].get("meta") or {}).get("backend", "unknown")
+                    if results else "unknown"
+                    )
         fig.text(0.5, 0.988,
                  f"Sites: {site_ids}   |   backend: {backend}",
                  ha="center", va="top", fontsize=8, color="#aaaacc")
@@ -694,12 +685,12 @@ def test_full_render() -> None:
     from eo_types      import SiteEntry
 
     registry = [
-        SiteEntry(id="TM-01", name="Turkmenistan", lat=38.49, lon=54.19,
-                  wind_speed=4.0, wind_deg=120, Q_true=4000.0,
-                  seed=42, category="super-emitter"),
-        SiteEntry(id="HN-01", name="Hassi R'Mel", lat=32.93, lon=3.13,
-                  wind_speed=8.0, wind_deg=315, Q_true=300.0,
-                  seed=99, category="near-limit"),
+        {"id": "TM-01", "name": "Turkmenistan", "lat": 38.49, "lon": 54.19,
+         "wind_speed": 4.0, "wind_deg": 120, "Q_true": 4000.0,
+         "seed": 42, "category": "super-emitter"},
+        {"id": "HN-01", "name": "Hassi R'Mel", "lat": 32.93, "lon": 3.13,
+         "wind_speed": 8.0, "wind_deg": 315, "Q_true": 300.0,
+         "seed": 99, "category": "near-limit"},
     ]
 
     pipeline = EOPipeline(
@@ -746,18 +737,18 @@ if __name__ == "__main__":
     from eo_types      import SiteEntry
 
     _DEMO_REGISTRY = [
-        SiteEntry(id="TM-01", name="Turkmenistan Compressor Station",
-                  lat=38.49, lon=54.19, wind_speed=4.0, wind_deg=120,
-                  Q_true=4000.0, seed=42, category="super-emitter"),
-        SiteEntry(id="PB-01", name="Permian Basin Wellpad",
-                  lat=31.83, lon=-102.37, wind_speed=6.5, wind_deg=200,
-                  Q_true=800.0, seed=7, category="mid-range"),
-        SiteEntry(id="DZ-01", name="Algeria In Salah",
-                  lat=27.21, lon=2.52, wind_speed=3.0, wind_deg=45,
-                  Q_true=1800.0, seed=13, category="mid-range"),
-        SiteEntry(id="HN-01", name="Hassi R'Mel Flare Station",
-                  lat=32.93, lon=3.13, wind_speed=8.0, wind_deg=315,
-                  Q_true=300.0, seed=99, category="near-limit"),
+        {"id": "TM-01", "name": "Turkmenistan Compressor Station",
+         "lat": 38.49, "lon": 54.19, "wind_speed": 4.0, "wind_deg": 120,
+         "Q_true": 4000.0, "seed": 42, "category": "super-emitter"},
+        {"id": "PB-01", "name": "Permian Basin Wellpad",
+         "lat": 31.83, "lon": -102.37, "wind_speed": 6.5, "wind_deg": 200,
+         "Q_true": 800.0, "seed": 7, "category": "mid-range"},
+        {"id": "DZ-01", "name": "Algeria In Salah",
+         "lat": 27.21, "lon": 2.52, "wind_speed": 3.0, "wind_deg": 45,
+         "Q_true": 1800.0, "seed": 13, "category": "mid-range"},
+        {"id": "HN-01", "name": "Hassi R'Mel Flare Station",
+         "lat": 32.93, "lon": 3.13, "wind_speed": 8.0, "wind_deg": 315,
+         "Q_true": 300.0, "seed": 99, "category": "near-limit"},
     ]
 
     pipeline = EOPipeline(
@@ -768,11 +759,11 @@ if __name__ == "__main__":
     results = pipeline.run_all(_DEMO_REGISTRY)
     roc     = pipeline.build_roc(results, _DEMO_REGISTRY)
 
-    ReportBuilder(
-        report_title="earth-obs-toolkit — Demo Report"
+    fig = ReportBuilder(
+        report_title="openEOLIB Demo Report"
     ).build(
         results,
         roc       = roc,
-        save_path = "eo_toolkit_demo_report.png",
+        save_path = "openEOLIB_report.png",
     )
     plt.show()
