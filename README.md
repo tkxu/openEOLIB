@@ -1,6 +1,6 @@
 # openEOLIB
 
-Sentinel-2・ERA5・Sentinel-5P の衛星観測データを取得し、ガウスプルーム合成データによる検証パイプラインを構築するためのPythonライブラリです。
+Sentinel-2・ERA5・Sentinel-5P の衛星観測データを取得し、メタンガス漏洩検出の検証パイプラインを構築するための Python ライブラリです。
 
 推論エンジンを外部から差し込む設計になっており、独自の排出量推定アルゴリズムと組み合わせて使用できます。
 
@@ -22,32 +22,70 @@ Sentinel-2・ERA5・Sentinel-5P の衛星観測データを取得し、ガウス
 ```
 /
 ├── eo_types.py           モジュール間インターフェースの型定義 (TypedDict)
-├── eo_provider.py        実データ取得層 (openEO / CDSE)
-├── eo_simulator.py       ガウスプルーム合成データ生成器
+├── eo_engines.py         InferenceEngine / Provider ABC + NullInferenceEngine
 ├── eo_pipeline.py        観測データ処理パイプライン
-├── eo_visualisation.py   可視化モジュール
+├── eo_provider.py        実データ取得層 (openEO / CDSE)
+├── eo_era5.py            ERA5 風速・地表気圧取得 (cdsapi)
+├── eo_simulator.py       ガウスプルーム合成データ生成器
+├── eo_roc.py             ROC 曲線構築モジュール
+├── eo_cache.py           キャッシュ + Provenance 管理
+├── eo_visualisation.py   可視化パネル群
+├── eo_report.py          マスターフィギュア統合出力 (ReportBuilder)
 └── examples/
-    └── main_sample.py    使い方サンプル
+    └── main_sample.py    エンドツーエンドサンプル
+                          (MBSPThresholdEngine  / CustomEngine を含む)
 ```
 
 推論エンジンの実装（排出量逆推定アルゴリズム）は本リポジトリには含まれていません。
 `InferenceEngine` を継承したクラスを独自に実装して差し込んでください（後述）。
+
+### モジュール依存関係
+
+```
+eo_types.py                 唯一の共有インターフェース定義
+    ↑
+eo_engines.py               InferenceEngine / Provider ABC + NullInferenceEngine
+    ↑
+    ├── eo_pipeline.py       パイプライン (ROC 構築は eo_roc に委譲)
+    │       ↑
+    │   eo_roc.py            ROC 曲線構築
+    │
+    ├── eo_provider.py       実データ取得
+    │       ↑
+    │   eo_era5.py           ERA5 取得
+    │   eo_cache.py          キャッシュ + Provenance
+    │
+    └── eo_simulator.py      合成データ生成
+
+eo_visualisation.py         可視化パネル群 (SpectralPanel / StatisticalPanel / FlagsPanel)
+    ↑
+eo_report.py                ReportBuilder (パネルを組み合わせてレポート出力)
+
+examples/main_sample.py     MBSPThresholdEngine / CustomEngine
+                            build_engine() / build_provider() を定義
+```
 
 ---
 
 ## 依存ライブラリ
 
 ```bash
-pip install openeo rasterio numpy scipy matplotlib
+# 共通 (合成データ・ROC・可視化)
+pip install numpy scipy matplotlib
+
+# 実データ取得 (--provider real)
+pip install openeo rasterio xarray cdsapi
 ```
 
 | ライブラリ | 用途 |
 |---|---|
-| `openeo` | CDSE への接続・データ取得 |
-| `rasterio` | GeoTIFF → ndarray 変換 |
 | `numpy` | 数値計算 |
-| `scipy` | 空間フィルタ・最適化 |
+| `scipy` | 空間フィルタ・ロジスティック校正 |
 | `matplotlib` | 可視化 |
+| `openeo` | CDSE への接続・Sentinel-2 / S5P データ取得 |
+| `rasterio` | GeoTIFF → ndarray 変換 |
+| `xarray` | ERA5 NetCDF 読み込み |
+| `cdsapi` | ERA5 取得 (Copernicus CDS API) |
 
 Python バージョン: **3.8 以上**
 
@@ -55,7 +93,7 @@ Python バージョン: **3.8 以上**
 
 ## 認証の設定
 
-Sentinel-2・ERA5・Sentinel-5P のすべてのデータ取得に[Copernicus Data Space Ecosystem (CDSE)](https://dataspace.copernicus.eu/) のアカウントが必要です。
+Sentinel-2・ERA5・Sentinel-5P のすべてのデータ取得に [Copernicus Data Space Ecosystem (CDSE)](https://dataspace.copernicus.eu/) のアカウントが必要です。
 
 初回実行時に OIDC デバイスフロー認証が自動で起動します。
 
@@ -65,6 +103,13 @@ fetcher = DataFetcher()
 # 初回 fetch() 呼び出し時に URL が表示されてブラウザ認証が行われます
 ```
 
+認証方式は環境変数 `OPENEO_AUTH_METHOD` で切り替えられます。
+
+| 変数値 | 動作 |
+|---|---|
+| 未設定 (デフォルト) | リフレッシュトークン → デバイスフロー自動フォールバック |
+| `client_credentials` | CI / サービスアカウント向け (`OPENEO_CLIENT_ID` / `OPENEO_CLIENT_SECRET` も必要) |
+| `device` | 対話的デバイスフローを明示指定 |
 
 ---
 
@@ -73,19 +118,19 @@ fetcher = DataFetcher()
 ### 合成データで動作確認する（認証不要）
 
 ```python
-from eo_simulator    import PlumeSimulator
-from eo_pipeline     import EOPipeline, NullInferenceEngine
-from eo_types        import SiteEntry
-from eo_visualisation import ReportBuilder
+from eo_simulator  import PlumeSimulator
+from eo_pipeline   import EOPipeline
+from eo_engines    import NullInferenceEngine
+from eo_report     import ReportBuilder
 
-# サイトを定義する
+# サイトを定義する (TypedDict 形式)
 registry = [
-    SiteEntry(
-        id="TM-01", name="Turkmenistan Compressor Station",
-        lat=38.49, lon=54.19,
-        wind_speed=4.0, wind_deg=120,
-        Q_true=4000.0, seed=42, category="super-emitter",
-    ),
+    {
+        "id": "TM-01", "name": "Turkmenistan Compressor Station",
+        "lat": 38.49, "lon": 54.19,
+        "wind_speed": 4.0, "wind_deg": 120,
+        "Q_true": 4000.0, "seed": 42, "category": "super-emitter",
+    },
 ]
 
 # パイプラインを構築する
@@ -107,7 +152,8 @@ ReportBuilder().build(results, roc=roc, save_path="report.png")
 ```python
 from datetime import datetime, timezone
 from eo_provider import DataFetcher
-from eo_pipeline  import EOPipeline, NullInferenceEngine
+from eo_pipeline import EOPipeline
+from eo_engines  import NullInferenceEngine
 
 pipeline = EOPipeline(
     provider = DataFetcher(band_set="swir_only"),  # or "full", "eucalyptus"
@@ -130,7 +176,7 @@ Sentinel-2 の取得バンドを `band_set` パラメータで切り替えられ
 |---|---|---|
 | `"swir_only"` | B11・B12 | メタン検出の最小構成（デフォルト） |
 | `"full"` | B01〜B12 全13バンド | 土地被覆分類・雲マスク強化 |
-| `"eucalyptus"` | 10バンド | Project Eucalyptus DL モデル入力 |
+| `"eucalyptus"` | 10バンド (B01〜B05, B08, B8A, B09, B11, B12) | Project Eucalyptus DL モデル入力 |
 
 ```python
 fetcher = DataFetcher(band_set="full")
@@ -141,27 +187,27 @@ fetcher = DataFetcher(band_set="full")
 
 ## 推論エンジンの差し込み方
 
-`InferenceEngine` を継承して `infer()` を実装するだけで、
-任意の排出量推定アルゴリズムをパイプラインに接続できます。
+`InferenceEngine` (`eo_engines.py`) を継承して `infer()` を実装するだけで、任意の排出量推定アルゴリズムをパイプラインに接続できます。
 
 ```python
-from eo_pipeline import InferenceEngine
-from eo_types    import InferenceResult, QualityFlags
+from eo_engines import InferenceEngine
+from eo_types   import InferenceResult, QualityFlags
+import numpy as np
 
 class MyEngine(InferenceEngine):
     def infer(self, mbsp, wind_speed, wind_deg, **kwargs):
         # ここに独自アルゴリズムを実装する
         flags: QualityFlags = {
-            "low_wind": wind_speed < 2.0,
+            "low_wind":          wind_speed < 2.0,
             "multi_modal_theta": False,
-            "roi_unstable": False,
+            "roi_unstable":      False,
             "template_dominant": False,
         }
-        return InferenceResult(
-            q=3500.0, q_std=200.0,
-            mllr=120.0, p_det=0.92,
-            flags=flags,
-        )
+        return {
+            "q": 3500.0, "q_std": 200.0,
+            "mllr": 120.0, "p_det": 0.92,
+            "flags": flags,
+        }
 
 from eo_pipeline  import EOPipeline
 from eo_simulator import PlumeSimulator
@@ -172,8 +218,24 @@ pipeline = EOPipeline(
 )
 ```
 
----
+### 組み込みエンジン
 
+`examples/main_sample.py` に以下のエンジンが実装されています。
+
+| エンジン | クラス | 説明 |
+|---|---|---|
+| `mbsp` | `MBSPThresholdEngine` | B11/B12 閾値法 (Varon et al. 2021)・追加インストール不要 |
+| `eucalyptus` | `EucalyptusEngine` | Project Eucalyptus アダプタ・**非商用のみ** |
+| `null` | `NullInferenceEngine` | ダミーエンジン・テスト用 (`eo_engines.py`) |
+| `custom` | `CustomEngine` | カスタム実装サンプル |
+
+```python
+from examples.main_sample import MBSPThresholdEngine, build_engine
+
+engine = MBSPThresholdEngine(z_thresh=3.0, q_scale_factor=30.0)
+# または
+engine = build_engine("mbsp")   # "mbsp" / "eucalyptus" / "null" / "custom"
+```
 
 ---
 
@@ -204,21 +266,23 @@ visualize_mismatch_comparison(
         "B11": ndarray,   # 必須
         "B12": ndarray,   # 必須
         "B08": ndarray,   # band_set="full" 時のみ
-        ...
+        # ...
     },
     "wind_speed":       float | None,
     "wind_deg":         float | None,
     "sza":              ndarray | None,  # 実データのみ
-    "surface_pressure": float | None,    # 実データのみ
-    "ch4_column":       ndarray | None,  # 実データのみ
+    "vza":              ndarray | None,  # 実データのみ
+    "amf":              ndarray | None,  # 実データのみ
+    "surface_pressure": float | None,    # 実データのみ (ERA5)
+    "ch4_column":       ndarray | None,  # 実データのみ (Sentinel-5P)
     "plume_true":       ndarray | None,  # 合成データのみ
     "Q_true":           float | None,    # 合成データのみ
     "meta": {
         "backend":  "openeo" | "synthetic",
-        "band_set": "swir_only" | "full" | "eucalyptus",
+        "band_set": "swir_only" | "full" | "eucalyptus" | "custom",
         "sensors":  ["sentinel2", "era5", ...],
         "res_m":    20.0,
-        ...
+        # ...
     }
 }
 ```
@@ -227,25 +291,10 @@ visualize_mismatch_comparison(
 
 ---
 
-## モジュール依存関係
-
-```
-eo_types.py            ← 唯一の共有インターフェース定義
-    ↑ import
-    ├── eo_provider.py      実データ取得
-    ├── eo_simulator.py     合成データ生成
-    ├── eo_pipeline.py      パイプライン
-    └── eo_visualisation.py 可視化
-
-eo_pipeline.py
-    ├── import: eo_types.py
-    ├── import: eo_simulator.py  (ヌル試行生成)
-    └── 外部注入: InferenceEngine
-```
-
----
-
 ## テストの実行
+
+各モジュールは `if __name__ == "__main__":` ブロックに単体テストを内蔵しています。
+外部 API 接続が不要なテストは常時実行できます。
 
 ```bash
 # 型定義テスト（常時実行可）
@@ -257,8 +306,20 @@ python eo_simulator.py
 # パイプラインテスト（常時実行可）
 python eo_pipeline.py
 
+# ROC 曲線テスト（常時実行可）
+python eo_roc.py
+
+# キャッシュ・Provenance テスト（常時実行可）
+python eo_cache.py
+
 # 可視化テスト（常時実行可）
 python eo_visualisation.py
+
+# レポート出力テスト（常時実行可）
+python eo_report.py
+
+# ERA5 取得テスト（cdsapi 認証が必要）
+python eo_era5.py
 
 # 実データ取得テスト（openEO 認証が必要）
 python eo_provider.py
@@ -270,22 +331,32 @@ python eo_provider.py
 
 ```bash
 # MBSP 閾値法 + 合成データ（すぐ動く・認証不要）
-python examples/main_sample.py
+python examples/main_sample.py --provider synthetic
 
-# MBSP 閾値法 + 実データ
+# MBSP 閾値法 + 実データ（openEO 認証が必要）
 python examples/main_sample.py --engine mbsp --provider real --date 2023-07-15
 
-# Project Eucalyptus（要ライセンス確認）
-git clone https://github.com/Orbio-Earth/Project-Eucalyptus
-pip install -r Project-Eucalyptus/requirements.txt
-python examples/main_sample.py --engine eucalyptus
+# カスタムエンジン + 合成データ
+python examples/main_sample.py --engine custom --provider synthetic
+
 ```
+
+| オプション | 有効値 | デフォルト |
+|---|---|---|
+| `--engine` | `mbsp` / `eucalyptus` / `null` / `custom` | `mbsp` |
+| `--provider` | `real` / `synthetic` | `real` |
+| `--band-set` | `swir_only` / `full` / `eucalyptus` | `swir_only` |
+| `--date` | `YYYY-MM-DD` | `2023-07-15` |
+| `--time` | `HH:MM` (UTC) | `08:00` |
+| `--null-runs` | 整数 | `10` |
+| `--no-save` | フラグ | レポート画像を保存しない |
 
 ---
 
 ## ライセンス
+
 ```
-   ApacheLicense2.0
+Apache License 2.0
 ```
 
 ---
